@@ -1,85 +1,107 @@
 import { DurableObject } from "cloudflare:workers";
-export interface Env {
-  MULTIPLAYER_QUEUE: DurableObjectNamespace;
+interface QueueEntry {
+  peerId: string;
+  timestamp: number;
 }
-interface Player {
-  id: string;
-  ws: WebSocket;
-  joinedAt: number;
-  opponent?: Player;
-}
+/**
+ * Durable Object to manage the multiplayer matchmaking queue.
+ * Ensures a single source of truth for the waiting list across all worker instances.
+ */
 export class MultiplayerQueueDO extends DurableObject {
-  private players: Player[] = [];
+  /**
+   * Handle HTTP requests sent to this Durable Object.
+   */
   async fetch(request: Request): Promise<Response> {
-    const upgradeHeader = request.headers.get('Upgrade');
-    if (!upgradeHeader || upgradeHeader !== 'websocket') {
-      return new Response('Expected Upgrade: websocket', { status: 426 });
+    const url = new URL(request.url);
+    const path = url.pathname;
+    try {
+      if (request.method === "POST" && path === "/join") {
+        return await this.handleJoin(request);
+      }
+      if (request.method === "POST" && path === "/leave") {
+        return await this.handleLeave(request);
+      }
+      if (request.method === "GET" && path === "/count") {
+        return await this.handleCount();
+      }
+      return new Response("Not Found", { status: 404 });
+    } catch (error) {
+      console.error("DO Error:", error);
+      return new Response((error as Error).message, { status: 500 });
     }
-    const webSocketPair = new WebSocketPair();
-    const [client, server] = Object.values(webSocketPair);
-    this.ctx.acceptWebSocket(server);
-    this.handleConnection(server);
-    return new Response(null, {
-      status: 101,
-      webSocket: client,
-    });
   }
-  handleConnection(ws: WebSocket) {
-    const playerId = crypto.randomUUID();
-    const player: Player = { id: playerId, ws, joinedAt: Date.now() };
-    this.players.push(player);
-    ws.addEventListener('message', (event) => {
-      try {
-        const data = JSON.parse(event.data as string);
-        // RELAY LOGIC: Forward message to opponent if linked
-        if (data.type === 'RELAY' && player.opponent) {
-          if (player.opponent.ws.readyState === 1) { // 1 = OPEN
-             player.opponent.ws.send(JSON.stringify({ type: 'RELAY', payload: data.payload }));
-          }
-        }
-      } catch (e) {
-        // Ignore invalid messages
-      }
-    });
-    ws.addEventListener('close', () => {
-      // Remove from queue if they were queuing
-      this.players = this.players.filter(p => p.id !== playerId);
-      // Notify opponent if matched
-      if (player.opponent) {
-        if (player.opponent.ws.readyState === 1) {
-            try {
-                player.opponent.ws.send(JSON.stringify({ type: 'PEER_DISCONNECTED' }));
-            } catch (e) {
-                // Ignore send errors during disconnect
-            }
-        }
-        // Unlink
-        player.opponent.opponent = undefined;
-      }
-    });
-    this.matchmake();
-  }
-  matchmake() {
-    // Simple FIFO matchmaking
-    // We only match players who are NOT yet matched (opponent is undefined)
-    // The queue (this.players) only holds waiting players.
-    // Filter out any stale/closed connections from the queue before matching
-    this.players = this.players.filter(p => p.ws.readyState === 1);
-    while (this.players.length >= 2) {
-      const p1 = this.players.shift()!;
-      const p2 = this.players.shift()!;
-      // Link players for Relay
-      p1.opponent = p2;
-      p2.opponent = p1;
-      const gameCode = crypto.randomUUID().substring(0, 8).toUpperCase();
-      try {
-        // Notify players - DO NOT CLOSE SOCKETS
-        p1.ws.send(JSON.stringify({ type: 'MATCH_FOUND', role: 'host', code: gameCode }));
-        p2.ws.send(JSON.stringify({ type: 'MATCH_FOUND', role: 'client', code: gameCode }));
-      } catch (e) {
-        console.error("Error sending match data", e);
-        // If notification fails, they will likely disconnect/timeout naturally
-      }
+  /**
+   * Handle a player joining the queue.
+   * Checks for matches and returns opponent ID if found.
+   */
+  private async handleJoin(request: Request): Promise<Response> {
+    const { peerId } = await request.json() as { peerId: string };
+    if (!peerId) {
+      return Response.json({ success: false, error: "Missing peerId" }, { status: 400 });
     }
+    const now = Date.now();
+    // Retrieve current queue from storage
+    let queue = (await this.ctx.storage.get<QueueEntry[]>("queue")) || [];
+    // 1. Cleanup stale entries (older than 30s)
+    // This ensures we don't match with players who disconnected or timed out
+    queue = queue.filter(e => now - e.timestamp < 30000);
+    // 2. Check if user is already in queue
+    const existingIndex = queue.findIndex(e => e.peerId === peerId);
+    if (existingIndex !== -1) {
+      // Update timestamp to keep heartbeat alive
+      queue[existingIndex].timestamp = now;
+      await this.ctx.storage.put("queue", queue);
+      return Response.json({ success: true, match: false });
+    }
+    // 3. Matchmaking: Find an opponent
+    // Simple FIFO: Pick the first person who isn't me
+    const opponent = queue.find(e => e.peerId !== peerId);
+    if (opponent) {
+      // Match found!
+      // Remove opponent from queue (I was never added, so just remove them)
+      queue = queue.filter(e => e.peerId !== opponent.peerId);
+      await this.ctx.storage.put("queue", queue);
+      return Response.json({
+        success: true,
+        match: true,
+        opponentId: opponent.peerId
+      });
+    }
+    // 4. No match found, add self to queue
+    queue.push({ peerId, timestamp: now });
+    await this.ctx.storage.put("queue", queue);
+    return Response.json({ success: true, match: false });
+  }
+  /**
+   * Handle a player explicitly leaving the queue.
+   */
+  private async handleLeave(request: Request): Promise<Response> {
+    const { peerId } = await request.json() as { peerId: string };
+    if (!peerId) {
+      return Response.json({ success: false, error: "Missing peerId" }, { status: 400 });
+    }
+    let queue = (await this.ctx.storage.get<QueueEntry[]>("queue")) || [];
+    const initialLength = queue.length;
+    // Remove the player
+    queue = queue.filter(e => e.peerId !== peerId);
+    // Only write if changed
+    if (queue.length !== initialLength) {
+      await this.ctx.storage.put("queue", queue);
+    }
+    return Response.json({ success: true });
+  }
+  /**
+   * Get the current number of active players in the queue.
+   */
+  private async handleCount(): Promise<Response> {
+    let queue = (await this.ctx.storage.get<QueueEntry[]>("queue")) || [];
+    const now = Date.now();
+    // Filter stale entries for accurate count
+    const activeQueue = queue.filter(e => now - e.timestamp < 30000);
+    // Lazy cleanup: if we found stale entries, update storage to keep it clean
+    if (activeQueue.length !== queue.length) {
+      await this.ctx.storage.put("queue", activeQueue);
+    }
+    return Response.json({ success: true, count: activeQueue.length });
   }
 }
