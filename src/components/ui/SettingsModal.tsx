@@ -12,8 +12,7 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
   const settings = useGameStore(s => s.settings);
   const toggleSetting = useGameStore(s => s.toggleSetting);
   return (
-    // Added pointer-events-auto to ensure clicks are captured
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 pointer-events-auto">
+    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
       <motion.div
         initial={{ scale: 0.9, opacity: 0 }}
         animate={{ scale: 1, opacity: 1 }}
@@ -39,8 +38,8 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
                     </div>
                     <span className="font-medium text-lg">Sound Effects</span>
                 </div>
-                <Switch
-                    checked={settings.sound}
+                <Switch 
+                    checked={settings.sound} 
                     onCheckedChange={() => toggleSetting('sound')}
                     className="data-[state=checked]:bg-blue-600"
                 />
@@ -53,8 +52,8 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
                     </div>
                     <span className="font-medium text-lg">Music</span>
                 </div>
-                <Switch
-                    checked={settings.music}
+                <Switch 
+                    checked={settings.music} 
                     onCheckedChange={() => toggleSetting('music')}
                     className="data-[state=checked]:bg-purple-600"
                 />
@@ -67,8 +66,8 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
                     </div>
                     <span className="font-medium text-lg">Haptics</span>
                 </div>
-                <Switch
-                    checked={settings.vibration}
+                <Switch 
+                    checked={settings.vibration} 
                     onCheckedChange={() => toggleSetting('vibration')}
                     className="data-[state=checked]:bg-green-600"
                 />
